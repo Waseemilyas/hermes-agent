@@ -146,6 +146,14 @@ are useful. They are not boundaries.
   adversarial output.
 - **Output redaction** strips secret-like patterns from display.
   A motivated output producer will defeat it.
+- The **config-write gate** refuses agent writes to
+  `HERMES_HOME/config.yaml` by default, and — where an operator
+  opts in to agent edits of the active profile's own config —
+  locks the approval/security keys and asks the human for every
+  write. The terminal runs as the same OS user and can still
+  write the file under ordinary command approval, so this narrows
+  a cooperative-mode footgun; it is not a boundary. See
+  [docs/security/active-profile-config-writes.md](docs/security/active-profile-config-writes.md).
 - **Skills Guard** scans installable skill content for injection
   patterns. It is a review aid; the boundary for third-party skills
   is operator review before install. Reviewing a skill means

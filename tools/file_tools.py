@@ -681,6 +681,76 @@ def _get_hermes_config_resolved() -> str | None:
     return _hermes_config_resolved
 
 
+_hermes_root_resolved: str | None = None
+_hermes_root_resolved_loaded = False
+
+
+def _get_hermes_root_resolved() -> str | None:
+    """Return the resolved Hermes ROOT dir — the parent of every profile.
+
+    ``HERMES_HOME`` points at ``<root>/profiles/<name>`` in profile mode, so
+    the root is where the SHARED config that profile-less sessions load
+    lives. Cached like ``_get_hermes_config_resolved``.
+    """
+    global _hermes_root_resolved, _hermes_root_resolved_loaded
+    if _hermes_root_resolved_loaded:
+        return _hermes_root_resolved
+    _hermes_root_resolved_loaded = True
+    try:
+        from hermes_constants import get_default_hermes_root
+        _hermes_root_resolved = str(get_default_hermes_root().resolve())
+    except Exception:
+        try:
+            _hermes_root_resolved = str(Path(_expand_tilde("~/.hermes")).resolve())
+        except Exception:
+            _hermes_root_resolved = None
+    return _hermes_root_resolved
+
+
+def _classify_hermes_config_target(resolved: str, normalized: str) -> str | None:
+    """Classify a write target that lands on a Hermes ``config.yaml``.
+
+    Returns:
+      * ``"active"`` — THIS session's config (``HERMES_HOME/config.yaml``).
+      * ``"shared"`` — the root config every profile-less session loads.
+      * ``"other_profile"`` — some other profile's config.
+      * ``None`` — not a Hermes config file.
+
+    Both the input path and its realpath are matched, so a symlink pointing
+    AT a config file is classified by its target (same lesson as #41351).
+    """
+    candidates: list[str] = []
+    for value in (resolved, normalized):
+        if not value:
+            continue
+        if value not in candidates:
+            candidates.append(value)
+        try:
+            real = os.path.realpath(value)
+        except (OSError, ValueError):
+            continue
+        if real not in candidates:
+            candidates.append(real)
+
+    active = _get_hermes_config_resolved()
+    if active and active in candidates:
+        return "active"
+
+    root = _get_hermes_root_resolved()
+    if not root:
+        return None
+    if os.path.join(root, "config.yaml") in candidates:
+        return "shared"
+    profiles_dir = os.path.join(root, "profiles")
+    for candidate in candidates:
+        if not candidate.startswith(profiles_dir + os.sep):
+            continue
+        rel = candidate[len(profiles_dir) + 1:].split(os.sep)
+        if len(rel) == 2 and rel[1] == "config.yaml":
+            return "other_profile"
+    return None
+
+
 def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:
     """Return an error message if the path targets a sensitive system location."""
     try:
@@ -697,16 +767,39 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
             return _err
     if resolved in _SENSITIVE_EXACT_PATHS or normalized in _SENSITIVE_EXACT_PATHS:
         return _err
-    # Prevent agents from modifying the Hermes config file directly.
-    # approvals.mode and other security settings live here; a malicious or
-    # prompt-injected agent could silently disable exec approval by writing to
-    # this file.
-    hermes_config = _get_hermes_config_resolved()
-    if hermes_config and (resolved == hermes_config or normalized == hermes_config):
+    # Hermes config files. approvals.mode and the other security settings
+    # live here, and the config cache is mtime-keyed, so a write takes effect
+    # mid-session — a prompt-injected agent could otherwise disable its own
+    # exec approval and immediately use the hole.
+    #
+    # Another home's config (the shared root config, or another profile's) is
+    # never writable through the file tools: it steers sessions this one is
+    # not running. The ACTIVE profile's own config is writable only when the
+    # user has opted in, and then only through the always-ask gate in
+    # ``_check_hermes_config_write``. See
+    # docs/security/active-profile-config-writes.md.
+    config_target = _classify_hermes_config_target(resolved, normalized)
+    if config_target == "active":
+        if not _active_profile_config_edits_allowed():
+            return (
+                f"Refusing to write to Hermes config file: {filepath}\n"
+                "Agent cannot modify security-sensitive configuration. "
+                "Edit ~/.hermes/config.yaml directly or use 'hermes config' "
+                "instead. (The user can opt in to agent edits of the ACTIVE "
+                "profile's config with "
+                "security.allow_active_profile_config_edits: true; every "
+                "write still needs their approval, and the approval/security "
+                "keys stay locked either way.)"
+            )
+    elif config_target is not None:
+        which = ("the SHARED root config" if config_target == "shared"
+                 else "ANOTHER profile's config")
         return (
             f"Refusing to write to Hermes config file: {filepath}\n"
-            "Agent cannot modify security-sensitive configuration. "
-            "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead."
+            f"That path is {which}, which steers sessions other than this "
+            "one. Only the active profile's own config can ever be edited by "
+            "the agent. Ask the user to make this change themselves, or use "
+            "'hermes config'."
         )
     return None
 
@@ -840,30 +933,20 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
     return None
 
 
-def _request_protected_instruction_approval(
-        reasons: list[str], task_id: str = "default") -> str | None:
-    """Ask the human to approve a write to protected instruction file(s).
+def _request_one_shot_approval(*, display: str, description: str,
+                               pattern_key: str, blocked: str) -> str | None:
+    """Ask the human to approve ONE operation, with no persistent scope.
 
-    Returns ``None`` when approved, or a BLOCKED error string. This gate
+    Shared by the gates that must re-ask every time: the protected
+    agent-instruction files and the active-profile config write. It
     intentionally does NOT route through ``_run_approval_gate``: that gate
     honors --yolo and session/permanent allowlists, and the entire point
     here is one-operation approval EVERY time, with no persistent scope
     and no yolo bypass. Fail-closed when no human channel exists.
-    """
-    targets = ", ".join(dict.fromkeys(reasons))
-    description = (
-        f"Write to protected agent-instruction file(s): {targets}. "
-        "These files steer future agent behavior; approval is always "
-        "required (not bypassed by auto-approve)."
-    )
-    display = f"<write to {targets}>"
-    blocked = (
-        f"BLOCKED: write to protected agent-instruction file(s) ({targets}) "
-        "{why} The user has NOT consented to this write. Do NOT retry it or "
-        "attempt the same edit via another path (terminal, execute_code, "
-        "etc.)."
-    )
 
+    ``blocked`` is a template carrying a single ``{why}`` field. Returns
+    ``None`` when approved, else the formatted BLOCKED string.
+    """
     try:
         import tools.approval as _approval
     except Exception:
@@ -884,8 +967,8 @@ def _request_protected_instruction_approval(
     if notify_cb is not None:
         approval_data = {
             "command": display,
-            "pattern_key": "protected_instruction_file",
-            "pattern_keys": ["protected_instruction_file"],
+            "pattern_key": pattern_key,
+            "pattern_keys": [pattern_key],
             "description": description,
             "allow_permanent": False,
             "allow_session": False,
@@ -939,6 +1022,33 @@ def _request_protected_instruction_approval(
             "present to approve it.")
 
 
+def _request_protected_instruction_approval(
+        reasons: list[str], task_id: str = "default") -> str | None:
+    """Ask the human to approve a write to protected instruction file(s).
+
+    Returns ``None`` when approved, or a BLOCKED error string. Always-ask,
+    one-operation, no yolo bypass — see ``_request_one_shot_approval``.
+    """
+    targets = ", ".join(dict.fromkeys(reasons))
+    description = (
+        f"Write to protected agent-instruction file(s): {targets}. "
+        "These files steer future agent behavior; approval is always "
+        "required (not bypassed by auto-approve)."
+    )
+    blocked = (
+        f"BLOCKED: write to protected agent-instruction file(s) ({targets}) "
+        "{why} The user has NOT consented to this write. Do NOT retry it or "
+        "attempt the same edit via another path (terminal, execute_code, "
+        "etc.)."
+    )
+    return _request_one_shot_approval(
+        display=f"<write to {targets}>",
+        description=description,
+        pattern_key="protected_instruction_file",
+        blocked=blocked,
+    )
+
+
 def _check_protected_instruction_write(paths: list[str],
                                        task_id: str = "default") -> str | None:
     """Gate a write/patch touching protected instruction files.
@@ -962,6 +1072,338 @@ def _check_protected_instruction_write(paths: list[str],
     if not reasons:
         return None
     return _request_protected_instruction_approval(reasons, task_id)
+
+
+# ---------------------------------------------------------------------------
+# Active-profile config writes (opt-in, always-ask, locked security keys)
+# ---------------------------------------------------------------------------
+# ``HERMES_HOME/config.yaml`` IS the security policy: approvals.mode, the
+# permanent-approval allowlist, the security.* gates, plugin enablement and
+# the secret bindings all live there, and the config cache is mtime-keyed so
+# a write takes effect mid-session. That is why _check_sensitive_path refuses
+# it outright by default.
+#
+# Operators who want the agent to maintain its OWN profile config (model
+# routing, timeouts, display knobs) opt in with
+# ``security.allow_active_profile_config_edits: true``. That opens exactly
+# this and nothing else:
+#
+#   * only the ACTIVE profile's config — never the shared root config, never
+#     another profile's, never .env / auth.json / any credential store, all
+#     of which stay hard-denied by their existing guards;
+#   * only when HERMES_HOME is a named profile (a profile-less session's
+#     config IS the shared root config, so it keeps the hard refusal);
+#   * never a change to a LOCKED key (below) — refused outright, so the agent
+#     can neither disable its own approval gate nor grant itself this
+#     capability (the opt-in itself lives under the locked ``security`` key);
+#   * and every write still needs a fresh human approval that --yolo does not
+#     bypass, with no session/permanent scope.
+#
+# write_file supplies the whole document, so the locked keys are diffed
+# BEFORE anything is applied. A patch cannot be pre-checked (the patch engine,
+# not the caller, produces the resulting document), so a patch is verified
+# after it applies and rolled back inside the same lock.
+#
+# Docs: docs/security/active-profile-config-writes.md
+
+_LOCKED_CONFIG_KEYS: tuple[tuple[str, ...], ...] = (
+    ("approvals",),                        # mode, deny rules, cron/single-query
+    ("security",),                         # incl. this feature's own opt-in
+    ("command_allowlist",),
+    ("hooks_auto_accept",),
+    ("secrets",),                          # Bitwarden binding / secret sources
+    ("plugins",),                          # in-process code with full agent rights
+    ("code_execution", "mode"),
+    ("skills", "write_approval"),
+    ("skills", "guard_agent_created"),
+    ("skills", "inline_shell"),
+    ("memory", "write_approval"),
+    ("delegation", "subagent_auto_approve"),
+    ("dashboard", "basic_auth"),
+    ("dashboard", "oauth"),
+    ("terminal", "credential_files"),
+    ("gateway", "media_delivery_allow_dirs"),
+)
+
+_CONFIG_KEY_MISSING = object()
+
+
+def _config_key_value(data: dict, key_path: tuple[str, ...]):
+    """Return the value at ``key_path``, or a sentinel when absent.
+
+    The sentinel makes "key removed" differ from "key set to None", so
+    deleting a locked section counts as a change.
+    """
+    current = data
+    for key in key_path:
+        if not isinstance(current, dict) or key not in current:
+            return _CONFIG_KEY_MISSING
+        current = current[key]
+    return current
+
+
+def _active_home_is_profile() -> bool:
+    """True when HERMES_HOME is a named profile dir, not the shared root."""
+    try:
+        from agent.file_safety import _resolve_active_profile_name
+        return _resolve_active_profile_name() != "default"
+    except Exception:
+        return False
+
+
+def _active_profile_config_edits_allowed() -> bool:
+    """Read ``security.allow_active_profile_config_edits`` (default False).
+
+    Fail-closed: a config read error, a non-``True`` value, or a session
+    whose HERMES_HOME is the shared root rather than a named profile all
+    keep the historical hard refusal.
+    """
+    try:
+        from hermes_cli.config import load_config, cfg_get
+        allowed = cfg_get(load_config(), "security",
+                          "allow_active_profile_config_edits", default=False)
+    except Exception:
+        return False
+    if allowed is not True:
+        return False
+    return _active_home_is_profile()
+
+
+def _parse_config_document(text: str):
+    """Parse a config document. Returns ``(mapping, error)``."""
+    import yaml
+    try:
+        data = yaml.safe_load(text) if text.strip() else {}
+    except yaml.YAMLError as exc:
+        return None, f"it is not valid YAML ({exc.__class__.__name__})"
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        return None, "its top level is not a YAML mapping"
+    return data, None
+
+
+def _locked_config_key_changes(old_text: str,
+                               new_text: str) -> tuple[list[str], str | None]:
+    """Diff the locked security keys between two config documents.
+
+    Returns ``(changed_keys, error)``. ``error`` is set when either document
+    cannot be read as a YAML mapping — refusing beats writing a config the
+    loader would silently fall back out of, and an unparseable CURRENT file
+    means the locked keys cannot be verified as unchanged.
+    """
+    new_data, new_err = _parse_config_document(new_text)
+    if new_err:
+        return [], f"the proposed content is unusable: {new_err}."
+    old_data, old_err = _parse_config_document(old_text)
+    if old_err:
+        return [], ("the config currently on disk is unusable "
+                    f"({old_err}), so the locked security keys cannot be "
+                    "verified as unchanged.")
+    changed = [
+        ".".join(key_path)
+        for key_path in _LOCKED_CONFIG_KEYS
+        if _config_key_value(old_data, key_path)
+        != _config_key_value(new_data, key_path)
+    ]
+    return changed, None
+
+
+def _summarize_config_changes(old_text: str, new_text: str) -> str:
+    """Name the top-level config sections a write would change (for the prompt)."""
+    old_data, old_err = _parse_config_document(old_text)
+    new_data, new_err = _parse_config_document(new_text)
+    if old_err or new_err:
+        return "unknown"
+    changed = [
+        key for key in sorted(set(old_data) | set(new_data))
+        if old_data.get(key, _CONFIG_KEY_MISSING)
+        != new_data.get(key, _CONFIG_KEY_MISSING)
+    ]
+    if not changed:
+        return "none (the document is equivalent to the current one)"
+    shown = ", ".join(changed[:8])
+    if len(changed) > 8:
+        shown += f" (+{len(changed) - 8} more)"
+    return shown
+
+
+def _active_config_targets(
+        paths: list[str], task_id: str = "default"
+) -> tuple[list[tuple[str, str]], int]:
+    """Classify write targets against the active profile config.
+
+    Returns ``(active_targets, distinct_path_count)`` where each active
+    target is ``(as_given, resolved)``. The count covers EVERY path in the
+    operation (deduplicated), so a multi-file patch that happens to include
+    the config can be refused — one approval prompt naming the config must
+    not silently carry other files along with it.
+    """
+    targets: list[tuple[str, str]] = []
+    distinct: list[str] = []
+    for candidate in paths:
+        normalized = os.path.normpath(_expand_tilde(candidate))
+        try:
+            resolved = str(_resolve_path_for_task(candidate, task_id))
+        except (OSError, ValueError, RuntimeError):
+            resolved = normalized
+        if resolved not in distinct:
+            distinct.append(resolved)
+        if _classify_hermes_config_target(resolved, normalized) == "active":
+            targets.append((candidate, resolved))
+    return targets, len(distinct)
+
+
+def _check_hermes_config_write(paths: list[str], task_id: str = "default",
+                               *, new_content: str | None = None) -> str | None:
+    """Gate a write/patch that lands on the ACTIVE profile's ``config.yaml``.
+
+    Only reachable once the user opted in — ``_check_sensitive_path`` refuses
+    the path outright otherwise. ``new_content`` is the complete proposed
+    document (write_file) or ``None`` when the resulting document is not
+    knowable up front (patch); the patch case is verified after it applies by
+    ``_verify_patched_active_config``.
+
+    Returns ``None`` when the write may proceed, else an error string.
+    """
+    targets, distinct_paths = _active_config_targets(paths, task_id)
+    if not targets:
+        return None
+
+    display_path = targets[0][0]
+    if not _active_profile_config_edits_allowed():
+        # Defensive: _check_sensitive_path already refused this path.
+        return (
+            f"Refusing to write to Hermes config file: {display_path}\n"
+            "Agent edits of the active profile config are not enabled "
+            "(security.allow_active_profile_config_edits)."
+        )
+    if len(targets) > 1 or distinct_paths > 1:
+        return (
+            f"Refusing to edit the active profile config ({display_path}) as "
+            "part of a multi-file operation. Edit the config on its own so "
+            "the user approves exactly what is applied to it."
+        )
+
+    resolved = targets[0][1]
+    if new_content is not None:
+        try:
+            with open(resolved, "r", encoding="utf-8") as handle:
+                old_text = handle.read()
+        except FileNotFoundError:
+            old_text = ""
+        except OSError as exc:
+            return (
+                f"Refusing to write the active profile config "
+                f"({display_path}): its current contents could not be read "
+                f"to verify the locked security keys are unchanged "
+                f"({exc.__class__.__name__})."
+            )
+        changed, parse_error = _locked_config_key_changes(old_text, new_content)
+        if parse_error:
+            return (f"Refusing to write the active profile config "
+                    f"({display_path}): {parse_error}")
+        if changed:
+            return (
+                f"BLOCKED: this write would change locked security keys in "
+                f"{display_path}: {', '.join(changed)}. Approval settings, "
+                "the security section, the command allowlist, plugin "
+                "enablement and the secret bindings are never agent-editable "
+                "— the user changes those by hand or with 'hermes config'. "
+                "Re-send the write with those keys identical to the current "
+                "file. Do NOT attempt the same edit via another path "
+                "(terminal, execute_code, etc.)."
+            )
+        detail = (f"Changed sections: {_summarize_config_changes(old_text, new_content)}. "
+                  "Locked security keys are already verified unchanged.")
+    else:
+        detail = (
+            "The resulting document is verified after the patch applies and "
+            "rolled back if it changes a locked security key."
+        )
+
+    description = (
+        f"Edit the ACTIVE profile config {display_path}. {detail} This file "
+        "steers every later session in this profile, so approval is always "
+        "required (not bypassed by auto-approve)."
+    )
+    blocked = (
+        f"BLOCKED: write to the active profile config ({display_path}) "
+        "{why} The user has NOT consented to this write. Do NOT retry it or "
+        "attempt the same edit via another path (terminal, execute_code, "
+        "etc.)."
+    )
+    return _request_one_shot_approval(
+        display=f"<write to {display_path}>",
+        description=description,
+        pattern_key="active_profile_config_write",
+        blocked=blocked,
+    )
+
+
+def _snapshot_active_config_patch_target(
+        paths: list[str], path_to_resolved: dict, task_id: str = "default"
+) -> tuple[str | None, str | None]:
+    """Return ``(resolved_config_path, pre_patch_text)`` for a config patch.
+
+    ``(None, None)`` when the patch does not touch the active profile config.
+    A ``None`` text with a non-``None`` path means the current contents could
+    not be read — the caller must refuse rather than patch, because a result
+    that changes a locked key could not then be rolled back.
+    """
+    for candidate in paths:
+        resolved = path_to_resolved.get(candidate)
+        if not resolved:
+            continue
+        normalized = os.path.normpath(_expand_tilde(candidate))
+        if _classify_hermes_config_target(resolved, normalized) != "active":
+            continue
+        try:
+            with open(resolved, "r", encoding="utf-8") as handle:
+                return resolved, handle.read()
+        except OSError:
+            return resolved, None
+    return None, None
+
+
+def _verify_patched_active_config(resolved: str, snapshot: str) -> str | None:
+    """Re-check the locked security keys after a patch touched the config.
+
+    Returns ``None`` when the patched document is acceptable. Otherwise
+    restores ``snapshot`` (the pre-patch bytes) and returns an error string.
+    Runs inside the patch lock so the rollback cannot race a sibling agent.
+    """
+    problem: str | None = None
+    try:
+        with open(resolved, "r", encoding="utf-8") as handle:
+            new_text = handle.read()
+    except OSError as exc:
+        problem = (f"the patched file could not be re-read to verify it "
+                   f"({exc.__class__.__name__})")
+    else:
+        changed, parse_error = _locked_config_key_changes(snapshot, new_text)
+        if not changed and not parse_error:
+            return None
+        problem = (f"it changed locked security keys ({', '.join(changed)})"
+                   if changed else parse_error)
+
+    restored = True
+    try:
+        from utils import atomic_write_text
+        atomic_write_text(resolved, snapshot, preserve_mode=True)
+    except Exception:
+        restored = False
+    tail = ("The file has been restored to its pre-patch contents."
+            if restored else
+            "RESTORING the pre-patch contents FAILED — tell the user to "
+            "check this file by hand.")
+    return (
+        f"BLOCKED: the patch to the active profile config ({resolved}) was "
+        f"rejected because {problem}. Approval settings, the security "
+        "section, the command allowlist, plugin enablement and the secret "
+        f"bindings are never agent-editable. {tail} Do NOT attempt the same "
+        "edit via another path (terminal, execute_code, etc.)."
+    )
 
 
 def _check_approval_required_write(paths: list[str],
@@ -2249,6 +2691,9 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
+    config_err = _check_hermes_config_write([path], task_id, new_content=content)
+    if config_err:
+        return tool_error(config_err)
     binary_doc_err = _check_binary_document_write(path, task_id)
     if binary_doc_err:
         return tool_error(binary_doc_err)
@@ -2396,6 +2841,13 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             cross_warning = _check_cross_profile_path(_p, task_id)
             if cross_warning:
                 return tool_error(cross_warning)
+    # A patch cannot show this gate the resulting document, so the approval
+    # happens here and the locked-key verification happens after the patch
+    # applies (_verify_patched_active_config, inside the path lock below).
+    config_err = _check_hermes_config_write(_paths_to_check, task_id,
+                                            new_content=None)
+    if config_err:
+        return tool_error(config_err)
     for _p in _content_write_paths:
         binary_doc_err = _check_binary_document_write(_p, task_id)
         if binary_doc_err:
@@ -2451,6 +2903,19 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 if _sw:
                     stale_warnings.append(_sw)
 
+            # Active-profile config: snapshot before the patch engine runs so
+            # a result that changes a locked security key can be rolled back
+            # inside this lock.
+            _config_path, _config_snapshot = _snapshot_active_config_patch_target(
+                _paths_to_check, _path_to_resolved, task_id)
+            if _config_path is not None and _config_snapshot is None:
+                return tool_error(
+                    f"Refusing to patch the active profile config "
+                    f"({_config_path}): its current contents could not be "
+                    "read, so a result that changes a locked security key "
+                    "could not be rolled back."
+                )
+
             file_ops = _get_file_ops(task_id)
 
             if mode == "replace":
@@ -2481,6 +2946,11 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 return tool_error(f"Unknown mode: {mode}")
 
             result_dict = result.to_dict()
+            if _config_path is not None and not result_dict.get("error"):
+                _config_err = _verify_patched_active_config(
+                    _config_path, _config_snapshot)
+                if _config_err:
+                    return tool_error(_config_err)
             if stale_warnings:
                 result_dict["_warning"] = stale_warnings[0] if len(stale_warnings) == 1 else " | ".join(stale_warnings)
             # Report the ABSOLUTE path(s) actually patched so a wrong-cwd
