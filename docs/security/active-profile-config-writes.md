@@ -22,6 +22,10 @@ security:
   `HERMES_HOME` is a named profile (`<root>/profiles/<name>`). The shared root
   config at `<root>/config.yaml` and every other profile's config stay refused
   with or without the opt-in — they steer sessions this one is not running.
+  Active-config (and root) lookup is keyed by this turn's Hermes home,
+  including `set_hermes_home_override()`, so a multiplexed process that
+  filled the cache as profile A does not keep classifying A's config as
+  `active` on a later profile-B turn.
 * **Only a profile session.** A profile-less session's config *is* the shared
   root config, so it keeps the hard refusal even with the flag set.
 * **Nothing else moves.** `.env`, `auth.json`, `mcp-tokens/`, the browser

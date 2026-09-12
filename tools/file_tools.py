@@ -664,29 +664,83 @@ _SENSITIVE_PATH_PREFIXES = (
 )
 _SENSITIVE_EXACT_PATHS = {"/var/run/docker.sock", "/run/docker.sock"}
 
+# Test pin: existing tests force a single path by setting these two
+# globals. Production lookup never sets ``_loaded`` — a multiplexed
+# process calls ``set_hermes_home_override()`` per turn, so a process-wide
+# cache would keep classifying the first profile's config as ``active``.
 _hermes_config_resolved: str | None = None
 _hermes_config_resolved_loaded = False
-
-
-def _get_hermes_config_resolved() -> str | None:
-    """Return the resolved absolute path of the Hermes config file (cached)."""
-    global _hermes_config_resolved, _hermes_config_resolved_loaded
-    if _hermes_config_resolved_loaded:
-        return _hermes_config_resolved
-    _hermes_config_resolved_loaded = True
-    try:
-        from hermes_cli.config import get_config_path
-        _hermes_config_resolved = str(get_config_path().resolve())
-    except Exception:
-        try:
-            _hermes_config_resolved = str(Path(_expand_tilde("~/.hermes/config.yaml")).resolve())
-        except Exception:
-            _hermes_config_resolved = None
-    return _hermes_config_resolved
-
+_hermes_config_by_home: dict[str, str | None] = {}
 
 _hermes_root_resolved: str | None = None
 _hermes_root_resolved_loaded = False
+_hermes_root_by_home: dict[str, str | None] = {}
+
+
+def _current_hermes_home_key() -> str:
+    """Stable key for this turn's Hermes home (follows the ContextVar override)."""
+    try:
+        from hermes_constants import hermes_home_key
+        return hermes_home_key()
+    except Exception:
+        try:
+            from hermes_constants import get_hermes_home
+            return str(get_hermes_home().resolve())
+        except Exception:
+            return ""
+
+
+def _get_hermes_config_resolved() -> str | None:
+    """Return this context's Hermes config path.
+
+    Cached per Hermes home: a multiplexed gateway process calls
+    ``set_hermes_home_override()`` per turn, so a process-wide cache would
+    keep classifying the first profile's config as ``active`` for every
+    later profile.
+    """
+    if _hermes_config_resolved_loaded:
+        return _hermes_config_resolved
+    key = _current_hermes_home_key()
+    if key in _hermes_config_by_home:
+        return _hermes_config_by_home[key]
+    try:
+        from hermes_cli.config import get_config_path
+        value = str(get_config_path().resolve())
+    except Exception:
+        try:
+            if key:
+                value = str((Path(key) / "config.yaml").resolve())
+            else:
+                value = str(Path(_expand_tilde("~/.hermes/config.yaml")).resolve())
+        except Exception:
+            value = None
+    _hermes_config_by_home[key] = value
+    return value
+
+
+def _compute_hermes_root_resolved(home_key: str) -> str | None:
+    """Root for the current home — parent of ``profiles/<name>``, else the home.
+
+    Derived from this turn's home so a ContextVar override is visible.
+    ``get_default_hermes_root()`` is keyed on the process env and would
+    otherwise keep the launch profile's root for every later turn.
+    """
+    if home_key:
+        home = Path(home_key)
+        try:
+            if home.parent.name == "profiles":
+                return str(home.parent.parent.resolve())
+            return str(home.resolve())
+        except Exception:
+            pass
+    try:
+        from hermes_constants import get_default_hermes_root
+        return str(get_default_hermes_root().resolve())
+    except Exception:
+        try:
+            return str(Path(_expand_tilde("~/.hermes")).resolve())
+        except Exception:
+            return None
 
 
 def _get_hermes_root_resolved() -> str | None:
@@ -694,21 +748,16 @@ def _get_hermes_root_resolved() -> str | None:
 
     ``HERMES_HOME`` points at ``<root>/profiles/<name>`` in profile mode, so
     the root is where the SHARED config that profile-less sessions load
-    lives. Cached like ``_get_hermes_config_resolved``.
+    lives. Cached per Hermes home like ``_get_hermes_config_resolved``.
     """
-    global _hermes_root_resolved, _hermes_root_resolved_loaded
     if _hermes_root_resolved_loaded:
         return _hermes_root_resolved
-    _hermes_root_resolved_loaded = True
-    try:
-        from hermes_constants import get_default_hermes_root
-        _hermes_root_resolved = str(get_default_hermes_root().resolve())
-    except Exception:
-        try:
-            _hermes_root_resolved = str(Path(_expand_tilde("~/.hermes")).resolve())
-        except Exception:
-            _hermes_root_resolved = None
-    return _hermes_root_resolved
+    key = _current_hermes_home_key()
+    if key in _hermes_root_by_home:
+        return _hermes_root_by_home[key]
+    value = _compute_hermes_root_resolved(key)
+    _hermes_root_by_home[key] = value
+    return value
 
 
 def _classify_hermes_config_target(resolved: str, normalized: str) -> str | None:

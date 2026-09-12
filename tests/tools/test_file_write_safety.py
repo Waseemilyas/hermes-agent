@@ -840,6 +840,65 @@ class TestActiveProfileConfigWrites:
         assert approvals["calls"] == []
         assert "other-model" in profile["other"].read_text(encoding="utf-8")
 
+    def test_multiplexed_profile_b_cannot_write_profile_a_config(
+        self, tmp_path, opt_in, approvals, monkeypatch
+    ):
+        """A same-process profile switch must not keep A's config as active.
+
+        The gateway scopes each turn with ``set_hermes_home_override()``.
+        Pinning ``_hermes_config_resolved`` would hide the bug this covers,
+        so this test uses the real lookup after filling the cache as A.
+        """
+        import tools.file_tools as ft
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        root = tmp_path / "hermes_root"
+        home_a = root / "profiles" / "haldir"
+        home_b = root / "profiles" / "atlas"
+        home_a.mkdir(parents=True)
+        home_b.mkdir(parents=True)
+        cfg_a = home_a / "config.yaml"
+        cfg_b = home_b / "config.yaml"
+        cfg_a.write_text(self.BASE_CONFIG, encoding="utf-8")
+        cfg_b.write_text(self.BASE_CONFIG, encoding="utf-8")
+        (root / "config.yaml").write_text(
+            "model:\n  default: root-model\n", encoding="utf-8"
+        )
+
+        monkeypatch.setattr(ft, "_active_home_is_profile", lambda: True)
+        ft._hermes_config_by_home.clear()
+        ft._hermes_root_by_home.clear()
+
+        tok_a = set_hermes_home_override(str(home_a))
+        try:
+            assert ft._get_hermes_config_resolved() == str(cfg_a.resolve())
+            approvals["answer"] = "once"
+            written_a = self._repinned("111111")
+            res = self._write(cfg_a, written_a)
+            assert not res.get("error"), res
+            assert cfg_a.read_text(encoding="utf-8") == written_a
+        finally:
+            reset_hermes_home_override(tok_a)
+
+        tok_b = set_hermes_home_override(str(home_b))
+        try:
+            assert ft._get_hermes_config_resolved() == str(cfg_b.resolve())
+            approvals["answer"] = "once"
+            before_a = cfg_a.read_text(encoding="utf-8")
+            res = self._write(cfg_a, self._repinned("999999"))
+            assert res.get("error") and "ANOTHER profile" in res["error"], res
+            assert cfg_a.read_text(encoding="utf-8") == before_a
+
+            new_b = self._repinned("222222")
+            res = self._write(cfg_b, new_b)
+            assert not res.get("error"), res
+            assert cfg_b.read_text(encoding="utf-8") == new_b
+        finally:
+            reset_hermes_home_override(tok_b)
+
     # ---- approval contract ----------------------------------------------
 
     def test_deny_blocks_write(self, profile, opt_in, approvals):
