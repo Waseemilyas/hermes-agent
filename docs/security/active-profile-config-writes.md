@@ -74,16 +74,20 @@ The prompt names the file and the top-level sections the write changes.
 * **`write_file`** supplies the whole document, so the locked keys are diffed
   between the file on disk and the proposed content *before* the approval
   prompt, then re-read and re-diffed inside the path lock immediately before
-  the write. If the file moved while the prompt was on screen (a sibling
-  subagent, or the user editing it) and applying the approved document would
-  now change a locked key, the write is refused. Content that is not a YAML
-  mapping — or a file on disk that no longer parses — is refused, so a bad
-  write cannot leave the loader silently falling back to defaults.
+  the write. The resolved active-config path is bound at approval; if the
+  path no longer resolves to exactly that file (a retargeted symlink, or a
+  sibling replacing the target) the write is refused. If the file's contents
+  moved while the prompt was on screen and applying the approved document
+  would now change a locked key, the write is refused. Content that is not
+  a YAML mapping — or a file on disk that no longer parses — is refused, so a
+  bad write cannot leave the loader silently falling back to defaults.
 * **`patch`** cannot be pre-checked: the patch engine, not the caller, produces
-  the resulting document. The approval happens first; then the file is
-  snapshotted, patched, and re-checked inside the same path lock. If the result
-  changes a locked key or stops parsing, the pre-patch contents are restored and
-  the tool reports the rejection.
+  the resulting document. The approval happens first, binding the same
+  resolved active-config path; then the file is snapshotted, patched, and
+  re-checked inside the same path lock. If the live target is no longer that
+  file, or the result changes a locked key or stops parsing, the pre-patch
+  contents are restored (when a snapshot exists) and the tool reports the
+  rejection.
 * A patch or write that touches the config **and** any other file is refused, so
   a single approval naming the config never carries other files with it.
 

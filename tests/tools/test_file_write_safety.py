@@ -11,6 +11,20 @@ import pytest
 from tools.file_operations import _is_write_denied
 
 
+def _can_symlink() -> bool:
+    """Check if we can create symlinks (needs admin/dev-mode on Windows)."""
+    import tempfile
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "src"
+            src.write_text("x")
+            lnk = Path(d) / "lnk"
+            lnk.symlink_to(src)
+            return True
+    except OSError:
+        return False
+
+
 class TestStaticDenyList:
     """Basic sanity checks for the static write deny list."""
 
@@ -508,6 +522,7 @@ class TestProtectedInstructionFiles:
 
     # ---- adversarial path shapes ----------------------------------------
 
+    @pytest.mark.skipif(not _can_symlink(), reason="Symlinks need elevated privileges")
     def test_symlink_to_protected_file_is_gated(self, tmp_path, approvals):
         """#41351 lesson: realpath first — innocent name, protected target."""
         real = tmp_path / "AGENTS.md"
@@ -984,6 +999,7 @@ class TestActiveProfileConfigWrites:
 
     # ---- adversarial path shapes ----------------------------------------
 
+    @pytest.mark.skipif(not _can_symlink(), reason="Symlinks need elevated privileges")
     def test_symlink_to_active_config_is_gated(
         self, profile, opt_in, approvals, tmp_path
     ):
@@ -994,6 +1010,7 @@ class TestActiveProfileConfigWrites:
         assert res.get("error"), res
         assert profile["active"].read_text(encoding="utf-8") == self.BASE_CONFIG
 
+    @pytest.mark.skipif(not _can_symlink(), reason="Symlinks need elevated privileges")
     def test_symlink_to_shared_root_config_is_refused(
         self, profile, opt_in, approvals, tmp_path
     ):
@@ -1007,6 +1024,70 @@ class TestActiveProfileConfigWrites:
         res = self._write(tmp_path / "notes.txt", "hello")
         assert not res.get("error"), res
         assert approvals["calls"] == []
+
+    @pytest.mark.skipif(not _can_symlink(), reason="Symlinks need elevated privileges")
+    @pytest.mark.parametrize("dest_key", ["root_config", "other"])
+    def test_write_refuses_when_approved_symlink_is_retargeted(
+        self, profile, opt_in, approvals, tmp_path, dest_key
+    ):
+        """An approved symlink must still resolve to the bound active config."""
+        from tools.terminal_tool import set_approval_callback
+
+        link = tmp_path / "approved.yaml"
+        link.symlink_to(profile["active"])
+        dest = profile[dest_key]
+        dest_before = dest.read_text(encoding="utf-8")
+
+        def cb(command, description, **kwargs):
+            approvals["calls"].append(
+                {"command": command, "description": description, **kwargs}
+            )
+            link.unlink()
+            link.symlink_to(dest)
+            return "once"
+
+        set_approval_callback(cb)
+        try:
+            res = self._write(link, self._repinned())
+        finally:
+            set_approval_callback(None)
+
+        assert res.get("error"), res
+        assert "waiting for approval" in res["error"]
+        assert profile["active"].read_text(encoding="utf-8") == self.BASE_CONFIG
+        assert dest.read_text(encoding="utf-8") == dest_before
+
+    @pytest.mark.skipif(not _can_symlink(), reason="Symlinks need elevated privileges")
+    @pytest.mark.parametrize("dest_key", ["root_config", "other"])
+    def test_patch_refuses_when_approved_symlink_is_retargeted(
+        self, profile, opt_in, approvals, tmp_path, dest_key
+    ):
+        from tools.terminal_tool import set_approval_callback
+
+        link = tmp_path / "approved-patch.yaml"
+        link.symlink_to(profile["active"])
+        dest = profile[dest_key]
+        dest_before = dest.read_text(encoding="utf-8")
+
+        def cb(command, description, **kwargs):
+            approvals["calls"].append(
+                {"command": command, "description": description, **kwargs}
+            )
+            link.unlink()
+            link.symlink_to(dest)
+            return "once"
+
+        set_approval_callback(cb)
+        try:
+            res = self._patch_replace(
+                link, "context_length: 200000", "context_length: 1000000")
+        finally:
+            set_approval_callback(None)
+
+        assert res.get("error"), res
+        assert "waiting for approval" in res["error"]
+        assert profile["active"].read_text(encoding="utf-8") == self.BASE_CONFIG
+        assert dest.read_text(encoding="utf-8") == dest_before
 
     # ---- patch tool ------------------------------------------------------
 
