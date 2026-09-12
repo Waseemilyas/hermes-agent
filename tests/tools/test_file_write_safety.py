@@ -913,6 +913,64 @@ class TestActiveProfileConfigWrites:
         assert approvals["calls"] == []
         assert profile["active"].read_text(encoding="utf-8") == self.BASE_CONFIG
 
+    @pytest.mark.parametrize(
+        "current,proposed",
+        [
+            (
+                None,
+                "mcp_servers:\n  evil:\n    command: /usr/bin/id\n",
+            ),
+            (
+                "mcp_servers:\n  fs:\n    command: npx\n",
+                "mcp_servers:\n  fs:\n    command: /usr/bin/id\n",
+            ),
+        ],
+        ids=["add", "change"],
+    )
+    def test_locked_mcp_servers_add_or_change_refused(
+        self, profile, opt_in, approvals, current, proposed
+    ):
+        """mcp_servers is the same class of key as plugins: a spawned process."""
+        on_disk = self.BASE_CONFIG + (current or "")
+        profile["active"].write_text(on_disk, encoding="utf-8")
+        res = self._write(profile["active"], self.BASE_CONFIG + proposed)
+        assert res.get("error") and "locked security keys" in res["error"]
+        assert "mcp_servers" in res["error"]
+        assert approvals["calls"] == [], "a locked-key write must never prompt"
+        assert profile["active"].read_text(encoding="utf-8") == on_disk
+
+    def test_write_refuses_when_config_changes_under_approval(
+        self, profile, opt_in, approvals
+    ):
+        """The write path re-diffs locked keys inside the path lock.
+
+        Approval is human-latency and happens *before* the lock. If
+        config.yaml changes in that window, the approved document must not
+        be written whole (that would take the in-window change back out,
+        locked keys included).
+        """
+        mutated = self.BASE_CONFIG.replace("mode: smart", "mode: 'off'")
+        from tools.terminal_tool import set_approval_callback
+
+        def cb(command, description, **kwargs):
+            approvals["calls"].append(
+                {"command": command, "description": description, **kwargs}
+            )
+            profile["active"].write_text(mutated, encoding="utf-8")
+            return "once"
+
+        set_approval_callback(cb)
+        try:
+            res = self._write(profile["active"], self._repinned())
+        finally:
+            set_approval_callback(None)
+
+        assert res.get("error"), res
+        assert "changed while" in res["error"]
+        assert "locked security keys" in res["error"]
+        assert "approvals" in res["error"]
+        assert profile["active"].read_text(encoding="utf-8") == mutated
+
     def test_invalid_yaml_refused(self, profile, opt_in, approvals):
         res = self._write(profile["active"], "model:\n  default: [unclosed\n")
         assert res.get("error") and "unusable" in res["error"]
@@ -1100,6 +1158,16 @@ class TestLockedConfigKeyDiff:
         )
         assert err is None
         assert changed == ["command_allowlist"]
+
+    def test_introducing_mcp_servers_is_caught(self):
+        from tools.file_tools import _LOCKED_CONFIG_KEYS, _locked_config_key_changes
+        assert ("mcp_servers",) in _LOCKED_CONFIG_KEYS
+        changed, err = _locked_config_key_changes(
+            "model:\n  default: a\n",
+            "model:\n  default: a\nmcp_servers:\n  evil:\n    command: /usr/bin/id\n",
+        )
+        assert err is None
+        assert changed == ["mcp_servers"]
 
     def test_unparseable_current_file_refuses(self):
         from tools.file_tools import _locked_config_key_changes

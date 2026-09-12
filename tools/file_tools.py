@@ -1104,7 +1104,9 @@ def _check_protected_instruction_write(paths: list[str],
 #     bypass, with no session/permanent scope.
 #
 # write_file supplies the whole document, so the locked keys are diffed
-# BEFORE anything is applied. A patch cannot be pre-checked (the patch engine,
+# BEFORE the approval prompt and again inside the path lock immediately
+# before the write — a sibling or the user can change the file while the
+# prompt is on screen. A patch cannot be pre-checked (the patch engine,
 # not the caller, produces the resulting document), so a patch is verified
 # after it applies and rolled back inside the same lock.
 #
@@ -1117,6 +1119,7 @@ _LOCKED_CONFIG_KEYS: tuple[tuple[str, ...], ...] = (
     ("hooks_auto_accept",),
     ("secrets",),                          # Bitwarden binding / secret sources
     ("plugins",),                          # in-process code with full agent rights
+    ("mcp_servers",),                     # spawned stdio processes; auto-reloaded
     ("code_execution", "mode"),
     ("skills", "write_approval"),
     ("skills", "guard_agent_created"),
@@ -1312,11 +1315,11 @@ def _check_hermes_config_write(paths: list[str], task_id: str = "default",
                 f"BLOCKED: this write would change locked security keys in "
                 f"{display_path}: {', '.join(changed)}. Approval settings, "
                 "the security section, the command allowlist, plugin "
-                "enablement and the secret bindings are never agent-editable "
-                "— the user changes those by hand or with 'hermes config'. "
-                "Re-send the write with those keys identical to the current "
-                "file. Do NOT attempt the same edit via another path "
-                "(terminal, execute_code, etc.)."
+                "enablement, MCP server entries and the secret bindings are "
+                "never agent-editable — the user changes those by hand or "
+                "with 'hermes config'. Re-send the write with those keys "
+                "identical to the current file. Do NOT attempt the same "
+                "edit via another path (terminal, execute_code, etc.)."
             )
         detail = (f"Changed sections: {_summarize_config_changes(old_text, new_content)}. "
                   "Locked security keys are already verified unchanged.")
@@ -1343,6 +1346,47 @@ def _check_hermes_config_write(paths: list[str], task_id: str = "default",
         pattern_key="active_profile_config_write",
         blocked=blocked,
     )
+
+
+def _reverify_active_config_write_under_lock(
+        resolved: str, new_content: str) -> str | None:
+    """Re-read and re-diff locked keys immediately before applying a write.
+
+    ``_check_hermes_config_write`` runs *before* ``file_state.lock_path``,
+    and the approval wait is human-latency. If ``config.yaml`` changes in
+    that window (a sibling subagent, or the user editing the file while the
+    prompt is on screen) the approved document would otherwise be written
+    whole and take that change back out — locked keys included. Called
+    inside the path lock, immediately before ``file_ops.write_file``.
+    """
+    if _classify_hermes_config_target(resolved, resolved) != "active":
+        return None
+    try:
+        with open(resolved, "r", encoding="utf-8") as handle:
+            old_text = handle.read()
+    except FileNotFoundError:
+        old_text = ""
+    except OSError as exc:
+        return (
+            f"Refusing to write the active profile config ({resolved}): "
+            "its current contents could not be re-read under the write "
+            f"lock ({exc.__class__.__name__}), so the locked security keys "
+            "cannot be verified as unchanged."
+        )
+    changed, parse_error = _locked_config_key_changes(old_text, new_content)
+    if parse_error:
+        return (f"Refusing to write the active profile config ({resolved}): "
+                f"{parse_error} The file changed while this write was waiting "
+                "for approval; re-read it and send a fresh write.")
+    if changed:
+        return (
+            f"BLOCKED: the active profile config ({resolved}) changed while "
+            "this write was waiting for approval; applying it would change "
+            f"locked security keys: {', '.join(changed)}. Re-read the file "
+            "and send a fresh write. Do NOT attempt the same edit via "
+            "another path (terminal, execute_code, etc.)."
+        )
+    return None
 
 
 def _snapshot_active_config_patch_target(
@@ -1404,9 +1448,10 @@ def _verify_patched_active_config(resolved: str, snapshot: str) -> str | None:
     return (
         f"BLOCKED: the patch to the active profile config ({resolved}) was "
         f"rejected because {problem}. Approval settings, the security "
-        "section, the command allowlist, plugin enablement and the secret "
-        f"bindings are never agent-editable. {tail} Do NOT attempt the same "
-        "edit via another path (terminal, execute_code, etc.)."
+        "section, the command allowlist, plugin enablement, MCP server "
+        f"entries and the secret bindings are never agent-editable. {tail} "
+        "Do NOT attempt the same edit via another path (terminal, "
+        "execute_code, etc.)."
     )
 
 
@@ -2760,6 +2805,17 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             _resolved = None
 
         if _resolved is None:
+            # The locked-key re-check needs the path lock. An active-config
+            # write that cannot resolve (and therefore cannot lock) must not
+            # apply the approved document against a file that may have
+            # moved during the approval wait.
+            normalized = os.path.normpath(_expand_tilde(path))
+            if _classify_hermes_config_target(normalized, normalized) == "active":
+                return tool_error(
+                    f"Refusing to write the active profile config ({path}): "
+                    "the path could not be resolved, so the locked security "
+                    "keys cannot be re-verified under the write lock."
+                )
             stale_warning = _check_file_staleness(path, task_id)
             file_ops = _get_file_ops(task_id)
             result = file_ops.write_file(path, content)
@@ -2782,6 +2838,10 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             # Workspace-divergence warning: relative path resolving outside the
             # terminal's cwd (the worktree-cwd bug). Lowest priority of the three.
             cwd_warning = _path_resolution_warning(path, Path(_resolved), task_id)
+            config_lock_err = _reverify_active_config_write_under_lock(
+                _resolved, content)
+            if config_lock_err:
+                return tool_error(config_lock_err)
             file_ops = _get_file_ops(task_id)
             result = file_ops.write_file(_resolved, content)
             result_dict = result.to_dict()

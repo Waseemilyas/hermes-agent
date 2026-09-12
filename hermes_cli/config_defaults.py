@@ -2745,7 +2745,7 @@ DEFAULT_CONFIG = {
         # default — the config carries the security policy. Even when on:
         # only this profile's config (never the shared root config or another
         # profile's), never a change to the locked security keys
-        # (approvals/security/command_allowlist/plugins/secrets/... — see
+        # (approvals/security/command_allowlist/plugins/mcp_servers/secrets/... — see
         # _LOCKED_CONFIG_KEYS in tools/file_tools.py), and every write needs a
         # fresh human approval that auto-approve/yolo does not bypass.
         # Docs: docs/security/active-profile-config-writes.md

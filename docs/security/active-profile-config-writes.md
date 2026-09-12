@@ -42,6 +42,7 @@ any of these keys, whether by editing, adding or removing them:
 | `hooks_auto_accept` | silent acceptance of hook output |
 | `secrets` | secret-manager binding |
 | `plugins` | in-process code with full agent privileges |
+| `mcp_servers` | spawned stdio processes; auto-reloaded on config change |
 | `code_execution.mode` | where `execute_code` runs |
 | `skills.write_approval`, `skills.guard_agent_created`, `skills.inline_shell` | skill authoring and execution gates |
 | `memory.write_approval` | memory write gate |
@@ -71,10 +72,13 @@ The prompt names the file and the top-level sections the write changes.
 ## How each tool is checked
 
 * **`write_file`** supplies the whole document, so the locked keys are diffed
-  between the file on disk and the proposed content *before* anything is
-  applied. Content that is not a YAML mapping — or a file on disk that no
-  longer parses — is refused, so a bad write cannot leave the loader silently
-  falling back to defaults.
+  between the file on disk and the proposed content *before* the approval
+  prompt, then re-read and re-diffed inside the path lock immediately before
+  the write. If the file moved while the prompt was on screen (a sibling
+  subagent, or the user editing it) and applying the approved document would
+  now change a locked key, the write is refused. Content that is not a YAML
+  mapping — or a file on disk that no longer parses — is refused, so a bad
+  write cannot leave the loader silently falling back to defaults.
 * **`patch`** cannot be pre-checked: the patch engine, not the caller, produces
   the resulting document. The approval happens first; then the file is
   snapshotted, patched, and re-checked inside the same path lock. If the result
