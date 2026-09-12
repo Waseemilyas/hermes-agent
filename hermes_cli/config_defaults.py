@@ -2740,6 +2740,16 @@ DEFAULT_CONFIG = {
         # fnmatch globs matched against the basename (e.g. "*.mdc").
         "protected_instruction_files": True,
         "protected_instruction_extra_patterns": [],
+        # Opt-in: let the agent's file tools edit the ACTIVE profile's own
+        # config.yaml (model routing, timeouts, display knobs). Off by
+        # default — the config carries the security policy. Even when on:
+        # only this profile's config (never the shared root config or another
+        # profile's), never a change to the locked security keys
+        # (approvals/security/command_allowlist/plugins/mcp_servers/secrets/... — see
+        # _LOCKED_CONFIG_KEYS in tools/file_tools.py), and every write needs a
+        # fresh human approval that auto-approve/yolo does not bypass.
+        # Docs: docs/security/active-profile-config-writes.md
+        "allow_active_profile_config_edits": False,
         "tirith_enabled": True,
         "tirith_path": "tirith",
         "tirith_timeout": 5,

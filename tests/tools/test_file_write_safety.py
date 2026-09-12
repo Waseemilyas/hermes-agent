@@ -11,6 +11,20 @@ import pytest
 from tools.file_operations import _is_write_denied
 
 
+def _can_symlink() -> bool:
+    """Check if we can create symlinks (needs admin/dev-mode on Windows)."""
+    import tempfile
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "src"
+            src.write_text("x")
+            lnk = Path(d) / "lnk"
+            lnk.symlink_to(src)
+            return True
+    except OSError:
+        return False
+
+
 class TestStaticDenyList:
     """Basic sanity checks for the static write deny list."""
 
@@ -508,6 +522,7 @@ class TestProtectedInstructionFiles:
 
     # ---- adversarial path shapes ----------------------------------------
 
+    @pytest.mark.skipif(not _can_symlink(), reason="Symlinks need elevated privileges")
     def test_symlink_to_protected_file_is_gated(self, tmp_path, approvals):
         """#41351 lesson: realpath first — innocent name, protected target."""
         real = tmp_path / "AGENTS.md"
@@ -685,6 +700,621 @@ class TestProtectedInstructionFiles:
             A.reset_current_session_key(token)
 
         assert rendered["choices"] == ["once", "deny"]
+
+
+class TestActiveProfileConfigWrites:
+    """The ACTIVE profile's config.yaml is editable only on explicit opt-in.
+
+    Default posture is the historical hard refusal. With
+    ``security.allow_active_profile_config_edits: true`` the agent may edit
+    THIS profile's config only, never the shared root config or another
+    profile's, never a locked security key, and never without a fresh human
+    approval that auto-approve does not bypass.
+    """
+
+    BASE_CONFIG = (
+        "model:\n"
+        "  default: deepseek/deepseek-v4\n"
+        "  context_length: 200000\n"
+        "approvals:\n"
+        "  mode: smart\n"
+        "  deny:\n"
+        "    - '*rm*-rf*'\n"
+        "security:\n"
+        "  allow_active_profile_config_edits: true\n"
+        "agent:\n"
+        "  verbose: false\n"
+    )
+
+    @pytest.fixture
+    def profile(self, tmp_path, monkeypatch):
+        """A fake Hermes root with an active profile, a shared root config
+        and a second profile."""
+        import tools.file_tools as ft
+
+        root = tmp_path / "hermes_root"
+        active_home = root / "profiles" / "haldir"
+        other_home = root / "profiles" / "atlas"
+        active_home.mkdir(parents=True)
+        other_home.mkdir(parents=True)
+        active_cfg = active_home / "config.yaml"
+        active_cfg.write_text(self.BASE_CONFIG, encoding="utf-8")
+        root_cfg = root / "config.yaml"
+        root_cfg.write_text("model:\n  default: root-model\n", encoding="utf-8")
+        other_cfg = other_home / "config.yaml"
+        other_cfg.write_text("model:\n  default: other-model\n", encoding="utf-8")
+
+        monkeypatch.setattr(ft, "_hermes_config_resolved", str(active_cfg.resolve()))
+        monkeypatch.setattr(ft, "_hermes_config_resolved_loaded", True)
+        monkeypatch.setattr(ft, "_hermes_root_resolved", str(root.resolve()))
+        monkeypatch.setattr(ft, "_hermes_root_resolved_loaded", True)
+        # HERMES_HOME is a named profile dir in this session.
+        monkeypatch.setattr(ft, "_active_home_is_profile", lambda: True)
+        return {
+            "root": root,
+            "active": active_cfg,
+            "root_config": root_cfg,
+            "other": other_cfg,
+        }
+
+    @pytest.fixture
+    def opt_in(self, monkeypatch):
+        """Toggle security.allow_active_profile_config_edits."""
+        import hermes_cli.config as C
+        state = {"enabled": True}
+        monkeypatch.setattr(
+            C, "load_config",
+            lambda: {"security": {
+                "allow_active_profile_config_edits": state["enabled"]}},
+        )
+        return state
+
+    @pytest.fixture
+    def approvals(self, monkeypatch):
+        """Install a CLI approval callback; record calls; scripted answers."""
+        from tools.terminal_tool import set_approval_callback
+        state = {"calls": [], "answer": "deny"}
+
+        def cb(command, description, **kwargs):
+            state["calls"].append(
+                {"command": command, "description": description, **kwargs}
+            )
+            return state["answer"]
+
+        set_approval_callback(cb)
+        yield state
+        set_approval_callback(None)
+
+    def _write(self, path, content):
+        import json
+        from tools.file_tools import write_file_tool
+        return json.loads(write_file_tool(str(path), content))
+
+    def _repinned(self, value="1000000"):
+        """BASE_CONFIG with a new context_length — an ordinary, allowed edit."""
+        return self.BASE_CONFIG.replace(
+            "context_length: 200000", f"context_length: {value}")
+
+    # ---- default posture ------------------------------------------------
+
+    def test_hard_refusal_when_not_opted_in(self, profile, opt_in, approvals):
+        opt_in["enabled"] = False
+        res = self._write(profile["active"], "model:\n  default: x\n")
+        assert res.get("error") and "Hermes config" in res["error"]
+        assert "allow_active_profile_config_edits" in res["error"]
+        assert approvals["calls"] == []
+        assert profile["active"].read_text(encoding="utf-8") == self.BASE_CONFIG
+
+    def test_profileless_session_keeps_hard_refusal(
+        self, profile, opt_in, approvals, monkeypatch
+    ):
+        """A profile-less session's config IS the shared root config."""
+        import tools.file_tools as ft
+        monkeypatch.setattr(ft, "_active_home_is_profile", lambda: False)
+        res = self._write(profile["active"], "model:\n  default: x\n")
+        assert res.get("error") and "Hermes config" in res["error"]
+        assert approvals["calls"] == []
+
+    def test_config_read_failure_fails_closed(self, profile, approvals, monkeypatch):
+        import hermes_cli.config as C
+
+        def boom():
+            raise RuntimeError("config unreadable")
+
+        monkeypatch.setattr(C, "load_config", boom)
+        res = self._write(profile["active"], "model:\n  default: x\n")
+        assert res.get("error") and "Hermes config" in res["error"]
+        assert approvals["calls"] == []
+
+    # ---- other homes are never editable ---------------------------------
+
+    def test_shared_root_config_always_refused(self, profile, opt_in, approvals):
+        res = self._write(profile["root_config"], "model:\n  default: x\n")
+        assert res.get("error") and "SHARED root config" in res["error"]
+        assert approvals["calls"] == []
+        assert "root-model" in profile["root_config"].read_text(encoding="utf-8")
+
+    def test_other_profile_config_always_refused(self, profile, opt_in, approvals):
+        res = self._write(profile["other"], "model:\n  default: x\n")
+        assert res.get("error") and "ANOTHER profile" in res["error"]
+        assert approvals["calls"] == []
+        assert "other-model" in profile["other"].read_text(encoding="utf-8")
+
+    def test_multiplexed_profile_b_cannot_write_profile_a_config(
+        self, tmp_path, opt_in, approvals, monkeypatch
+    ):
+        """A same-process profile switch must not keep A's config as active.
+
+        The gateway scopes each turn with ``set_hermes_home_override()``.
+        Pinning ``_hermes_config_resolved`` would hide the bug this covers,
+        so this test uses the real lookup after filling the cache as A.
+        """
+        import tools.file_tools as ft
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        root = tmp_path / "hermes_root"
+        home_a = root / "profiles" / "haldir"
+        home_b = root / "profiles" / "atlas"
+        home_a.mkdir(parents=True)
+        home_b.mkdir(parents=True)
+        cfg_a = home_a / "config.yaml"
+        cfg_b = home_b / "config.yaml"
+        cfg_a.write_text(self.BASE_CONFIG, encoding="utf-8")
+        cfg_b.write_text(self.BASE_CONFIG, encoding="utf-8")
+        (root / "config.yaml").write_text(
+            "model:\n  default: root-model\n", encoding="utf-8"
+        )
+
+        monkeypatch.setattr(ft, "_active_home_is_profile", lambda: True)
+        ft._hermes_config_by_home.clear()
+        ft._hermes_root_by_home.clear()
+
+        tok_a = set_hermes_home_override(str(home_a))
+        try:
+            assert ft._get_hermes_config_resolved() == str(cfg_a.resolve())
+            approvals["answer"] = "once"
+            written_a = self._repinned("111111")
+            res = self._write(cfg_a, written_a)
+            assert not res.get("error"), res
+            assert cfg_a.read_text(encoding="utf-8") == written_a
+        finally:
+            reset_hermes_home_override(tok_a)
+
+        tok_b = set_hermes_home_override(str(home_b))
+        try:
+            assert ft._get_hermes_config_resolved() == str(cfg_b.resolve())
+            approvals["answer"] = "once"
+            before_a = cfg_a.read_text(encoding="utf-8")
+            res = self._write(cfg_a, self._repinned("999999"))
+            assert res.get("error") and "ANOTHER profile" in res["error"], res
+            assert cfg_a.read_text(encoding="utf-8") == before_a
+
+            new_b = self._repinned("222222")
+            res = self._write(cfg_b, new_b)
+            assert not res.get("error"), res
+            assert cfg_b.read_text(encoding="utf-8") == new_b
+        finally:
+            reset_hermes_home_override(tok_b)
+
+    # ---- approval contract ----------------------------------------------
+
+    def test_deny_blocks_write(self, profile, opt_in, approvals):
+        approvals["answer"] = "deny"
+        res = self._write(profile["active"],
+                          self._repinned())
+        assert res.get("error") and "BLOCKED" in res["error"]
+        assert len(approvals["calls"]) == 1
+        assert profile["active"].read_text(encoding="utf-8") == self.BASE_CONFIG
+
+    def test_approve_once_allows_write(self, profile, opt_in, approvals):
+        approvals["answer"] = "once"
+        new_text = self._repinned()
+        res = self._write(profile["active"], new_text)
+        assert not res.get("error"), res
+        assert profile["active"].read_text(encoding="utf-8") == new_text
+        assert len(approvals["calls"]) == 1
+
+    def test_prompts_even_under_yolo(self, profile, opt_in, approvals, monkeypatch):
+        import tools.approval as A
+        monkeypatch.setattr(A, "_YOLO_MODE_FROZEN", True)
+        approvals["answer"] = "deny"
+        res = self._write(profile["active"],
+                          self._repinned())
+        assert res.get("error") and "BLOCKED" in res["error"]
+        assert len(approvals["calls"]) == 1, "yolo bypassed the config gate"
+        assert profile["active"].read_text(encoding="utf-8") == self.BASE_CONFIG
+
+    def test_prompt_offers_no_persistent_scope(self, profile, opt_in, approvals):
+        approvals["answer"] = "once"
+        self._write(profile["active"],
+                    self._repinned())
+        call = approvals["calls"][0]
+        assert call["allow_session"] is False
+        assert call["allow_permanent"] is False
+
+    def test_second_write_prompts_again(self, profile, opt_in, approvals):
+        approvals["answer"] = "once"
+        self._write(profile["active"], self._repinned("300000"))
+        self._write(profile["active"],
+                    self._repinned("300000").replace("300000", "400000"))
+        assert len(approvals["calls"]) == 2
+
+    def test_no_human_fails_closed(self, profile, opt_in):
+        res = self._write(profile["active"],
+                          self._repinned())
+        assert res.get("error") and "BLOCKED" in res["error"]
+        assert profile["active"].read_text(encoding="utf-8") == self.BASE_CONFIG
+
+    # ---- locked security keys -------------------------------------------
+
+    @pytest.mark.parametrize(
+        "old,new",
+        [
+            ("mode: smart", "mode: 'off'"),
+            ("    - '*rm*-rf*'", "    - '*never-matches*'"),
+        ],
+    )
+    def test_locked_approvals_change_refused_without_prompt(
+        self, profile, opt_in, approvals, old, new
+    ):
+        res = self._write(profile["active"],
+                          self.BASE_CONFIG.replace(old, new))
+        assert res.get("error") and "locked security keys" in res["error"]
+        assert "approvals" in res["error"]
+        assert approvals["calls"] == [], "a locked-key write must never prompt"
+        assert profile["active"].read_text(encoding="utf-8") == self.BASE_CONFIG
+
+    def test_agent_cannot_widen_its_own_opt_in(self, profile, opt_in, approvals):
+        """security.* is locked, so the gate cannot be reconfigured by the agent."""
+        res = self._write(
+            profile["active"],
+            self.BASE_CONFIG.replace(
+                "  allow_active_profile_config_edits: true",
+                "  allow_active_profile_config_edits: true\n  redact_secrets: false",
+            ),
+        )
+        assert res.get("error") and "locked security keys" in res["error"]
+        assert "security" in res["error"]
+        assert approvals["calls"] == []
+
+    def test_locked_section_removal_refused(self, profile, opt_in, approvals):
+        stripped = "model:\n  default: deepseek/deepseek-v4\n"
+        res = self._write(profile["active"], stripped)
+        assert res.get("error") and "locked security keys" in res["error"]
+        assert approvals["calls"] == []
+        assert profile["active"].read_text(encoding="utf-8") == self.BASE_CONFIG
+
+    @pytest.mark.parametrize(
+        "current,proposed",
+        [
+            (
+                None,
+                "mcp_servers:\n  evil:\n    command: /usr/bin/id\n",
+            ),
+            (
+                "mcp_servers:\n  fs:\n    command: npx\n",
+                "mcp_servers:\n  fs:\n    command: /usr/bin/id\n",
+            ),
+        ],
+        ids=["add", "change"],
+    )
+    def test_locked_mcp_servers_add_or_change_refused(
+        self, profile, opt_in, approvals, current, proposed
+    ):
+        """mcp_servers is the same class of key as plugins: a spawned process."""
+        on_disk = self.BASE_CONFIG + (current or "")
+        profile["active"].write_text(on_disk, encoding="utf-8")
+        res = self._write(profile["active"], self.BASE_CONFIG + proposed)
+        assert res.get("error") and "locked security keys" in res["error"]
+        assert "mcp_servers" in res["error"]
+        assert approvals["calls"] == [], "a locked-key write must never prompt"
+        assert profile["active"].read_text(encoding="utf-8") == on_disk
+
+    def test_write_refuses_when_config_changes_under_approval(
+        self, profile, opt_in, approvals
+    ):
+        """The write path re-diffs locked keys inside the path lock.
+
+        Approval is human-latency and happens *before* the lock. If
+        config.yaml changes in that window, the approved document must not
+        be written whole (that would take the in-window change back out,
+        locked keys included).
+        """
+        mutated = self.BASE_CONFIG.replace("mode: smart", "mode: 'off'")
+        from tools.terminal_tool import set_approval_callback
+
+        def cb(command, description, **kwargs):
+            approvals["calls"].append(
+                {"command": command, "description": description, **kwargs}
+            )
+            profile["active"].write_text(mutated, encoding="utf-8")
+            return "once"
+
+        set_approval_callback(cb)
+        try:
+            res = self._write(profile["active"], self._repinned())
+        finally:
+            set_approval_callback(None)
+
+        assert res.get("error"), res
+        assert "changed while" in res["error"]
+        assert "locked security keys" in res["error"]
+        assert "approvals" in res["error"]
+        assert profile["active"].read_text(encoding="utf-8") == mutated
+
+    def test_invalid_yaml_refused(self, profile, opt_in, approvals):
+        res = self._write(profile["active"], "model:\n  default: [unclosed\n")
+        assert res.get("error") and "unusable" in res["error"]
+        assert approvals["calls"] == []
+        assert profile["active"].read_text(encoding="utf-8") == self.BASE_CONFIG
+
+    def test_non_mapping_document_refused(self, profile, opt_in, approvals):
+        res = self._write(profile["active"], "- just\n- a list\n")
+        assert res.get("error") and "mapping" in res["error"]
+        assert approvals["calls"] == []
+
+    # ---- adversarial path shapes ----------------------------------------
+
+    @pytest.mark.skipif(not _can_symlink(), reason="Symlinks need elevated privileges")
+    def test_symlink_to_active_config_is_gated(
+        self, profile, opt_in, approvals, tmp_path
+    ):
+        link = tmp_path / "innocent.yaml"
+        link.symlink_to(profile["active"])
+        approvals["answer"] = "deny"
+        res = self._write(link, "model:\n  default: x\n")
+        assert res.get("error"), res
+        assert profile["active"].read_text(encoding="utf-8") == self.BASE_CONFIG
+
+    @pytest.mark.skipif(not _can_symlink(), reason="Symlinks need elevated privileges")
+    def test_symlink_to_shared_root_config_is_refused(
+        self, profile, opt_in, approvals, tmp_path
+    ):
+        link = tmp_path / "innocent2.yaml"
+        link.symlink_to(profile["root_config"])
+        res = self._write(link, "model:\n  default: x\n")
+        assert res.get("error") and "SHARED root config" in res["error"]
+        assert approvals["calls"] == []
+
+    def test_unrelated_file_never_prompts(self, profile, opt_in, approvals, tmp_path):
+        res = self._write(tmp_path / "notes.txt", "hello")
+        assert not res.get("error"), res
+        assert approvals["calls"] == []
+
+    @pytest.mark.skipif(not _can_symlink(), reason="Symlinks need elevated privileges")
+    @pytest.mark.parametrize("dest_key", ["root_config", "other"])
+    def test_write_refuses_when_approved_symlink_is_retargeted(
+        self, profile, opt_in, approvals, tmp_path, dest_key
+    ):
+        """An approved symlink must still resolve to the bound active config."""
+        from tools.terminal_tool import set_approval_callback
+
+        link = tmp_path / "approved.yaml"
+        link.symlink_to(profile["active"])
+        dest = profile[dest_key]
+        dest_before = dest.read_text(encoding="utf-8")
+
+        def cb(command, description, **kwargs):
+            approvals["calls"].append(
+                {"command": command, "description": description, **kwargs}
+            )
+            link.unlink()
+            link.symlink_to(dest)
+            return "once"
+
+        set_approval_callback(cb)
+        try:
+            res = self._write(link, self._repinned())
+        finally:
+            set_approval_callback(None)
+
+        assert res.get("error"), res
+        assert "waiting for approval" in res["error"]
+        assert profile["active"].read_text(encoding="utf-8") == self.BASE_CONFIG
+        assert dest.read_text(encoding="utf-8") == dest_before
+
+    @pytest.mark.skipif(not _can_symlink(), reason="Symlinks need elevated privileges")
+    @pytest.mark.parametrize("dest_key", ["root_config", "other"])
+    def test_patch_refuses_when_approved_symlink_is_retargeted(
+        self, profile, opt_in, approvals, tmp_path, dest_key
+    ):
+        from tools.terminal_tool import set_approval_callback
+
+        link = tmp_path / "approved-patch.yaml"
+        link.symlink_to(profile["active"])
+        dest = profile[dest_key]
+        dest_before = dest.read_text(encoding="utf-8")
+
+        def cb(command, description, **kwargs):
+            approvals["calls"].append(
+                {"command": command, "description": description, **kwargs}
+            )
+            link.unlink()
+            link.symlink_to(dest)
+            return "once"
+
+        set_approval_callback(cb)
+        try:
+            res = self._patch_replace(
+                link, "context_length: 200000", "context_length: 1000000")
+        finally:
+            set_approval_callback(None)
+
+        assert res.get("error"), res
+        assert "waiting for approval" in res["error"]
+        assert profile["active"].read_text(encoding="utf-8") == self.BASE_CONFIG
+        assert dest.read_text(encoding="utf-8") == dest_before
+
+    # ---- patch tool ------------------------------------------------------
+
+    def _patch_replace(self, path, old_string, new_string):
+        import json
+        from tools.file_tools import patch_tool
+        return json.loads(patch_tool(
+            mode="replace", path=str(path),
+            old_string=old_string, new_string=new_string,
+        ))
+
+    def test_patch_prompts_and_applies(self, profile, opt_in, approvals):
+        approvals["answer"] = "once"
+        res = self._patch_replace(
+            profile["active"], "context_length: 200000", "context_length: 1000000")
+        assert not res.get("error"), res
+        assert len(approvals["calls"]) == 1
+        assert "context_length: 1000000" in profile["active"].read_text(encoding="utf-8")
+
+    def test_patch_denied_leaves_file_untouched(self, profile, opt_in, approvals):
+        approvals["answer"] = "deny"
+        res = self._patch_replace(
+            profile["active"], "context_length: 200000", "context_length: 1000000")
+        assert res.get("error") and "BLOCKED" in res["error"]
+        assert profile["active"].read_text(encoding="utf-8") == self.BASE_CONFIG
+
+    def test_patch_changing_locked_key_is_rolled_back(
+        self, profile, opt_in, approvals
+    ):
+        """A patch cannot be pre-checked, so the result is verified and
+        reverted inside the patch lock."""
+        approvals["answer"] = "once"
+        res = self._patch_replace(profile["active"], "mode: smart", "mode: 'off'")
+        assert res.get("error") and "locked security keys" in res["error"]
+        assert "restored" in res["error"].lower()
+        assert profile["active"].read_text(encoding="utf-8") == self.BASE_CONFIG
+
+    def test_patch_making_config_unparseable_is_rolled_back(
+        self, profile, opt_in, approvals
+    ):
+        approvals["answer"] = "once"
+        res = self._patch_replace(
+            profile["active"], "model:", "model: [unclosed\nbroken:")
+        assert res.get("error"), res
+        assert profile["active"].read_text(encoding="utf-8") == self.BASE_CONFIG
+
+    def test_multifile_patch_including_config_is_refused(
+        self, profile, opt_in, approvals, tmp_path
+    ):
+        import json
+        from tools.file_tools import patch_tool
+        plain = tmp_path / "plain.txt"
+        plain.write_text("hello\n", encoding="utf-8")
+        patch = (
+            "*** Begin Patch\n"
+            f"*** Update File: {profile['active']}\n"
+            "@@\n"
+            "-  verbose: false\n"
+            "+  verbose: true\n"
+            f"*** Update File: {plain}\n"
+            "@@\n"
+            "-hello\n"
+            "+goodbye\n"
+            "*** End Patch"
+        )
+        res = json.loads(patch_tool(mode="patch", patch=patch))
+        assert res.get("error") and "multi-file operation" in res["error"]
+        assert approvals["calls"] == []
+        assert profile["active"].read_text(encoding="utf-8") == self.BASE_CONFIG
+        assert plain.read_text(encoding="utf-8") == "hello\n"
+
+
+    # ---- gateway round-trip ---------------------------------------------
+
+    def test_gateway_notify_resolve_once_allows(self, profile, opt_in):
+        import tools.approval as A
+        session_key = "active-config-test-session"
+        token = A.set_current_session_key(session_key)
+        try:
+            def notify(approval_data):
+                assert approval_data.get("allow_permanent") is False
+                assert approval_data.get("allow_session") is False
+                assert approval_data.get("pattern_key") == "active_profile_config_write"
+                A.resolve_gateway_approval(session_key, "once")
+
+            A.register_gateway_notify(session_key, notify)
+            try:
+                new_text = self._repinned()
+                res = self._write(profile["active"], new_text)
+                assert not res.get("error"), res
+                assert profile["active"].read_text(encoding="utf-8") == new_text
+            finally:
+                A.unregister_gateway_notify(session_key)
+        finally:
+            A.reset_current_session_key(token)
+
+    def test_gateway_deny_blocks(self, profile, opt_in):
+        import tools.approval as A
+        session_key = "active-config-deny-session"
+        token = A.set_current_session_key(session_key)
+        try:
+            def notify(approval_data):
+                A.resolve_gateway_approval(session_key, "deny")
+
+            A.register_gateway_notify(session_key, notify)
+            try:
+                res = self._write(profile["active"], self._repinned())
+                assert res.get("error") and "BLOCKED" in res["error"]
+                assert profile["active"].read_text(encoding="utf-8") == self.BASE_CONFIG
+            finally:
+                A.unregister_gateway_notify(session_key)
+        finally:
+            A.reset_current_session_key(token)
+
+
+class TestLockedConfigKeyDiff:
+    """Unit coverage for the locked-key differ used by both write paths."""
+
+    def test_unrelated_change_is_clean(self):
+        from tools.file_tools import _locked_config_key_changes
+        changed, err = _locked_config_key_changes(
+            "approvals:\n  mode: smart\nmodel:\n  default: a\n",
+            "approvals:\n  mode: smart\nmodel:\n  default: b\n",
+        )
+        assert (changed, err) == ([], None)
+
+    def test_reordered_equivalent_document_is_clean(self):
+        from tools.file_tools import _locked_config_key_changes
+        changed, err = _locked_config_key_changes(
+            "approvals:\n  mode: smart\n  timeout: 60\nmodel:\n  default: a\n",
+            "model:\n  default: a\napprovals:\n  timeout: 60\n  mode: smart\n",
+        )
+        assert (changed, err) == ([], None)
+
+    def test_nested_locked_key_change_is_caught(self):
+        from tools.file_tools import _locked_config_key_changes
+        changed, err = _locked_config_key_changes(
+            "skills:\n  write_approval: true\n",
+            "skills:\n  write_approval: false\n",
+        )
+        assert err is None
+        assert changed == ["skills.write_approval"]
+
+    def test_introducing_a_locked_section_is_caught(self):
+        from tools.file_tools import _locked_config_key_changes
+        changed, err = _locked_config_key_changes(
+            "model:\n  default: a\n",
+            "model:\n  default: a\ncommand_allowlist:\n  - rm -rf /\n",
+        )
+        assert err is None
+        assert changed == ["command_allowlist"]
+
+    def test_introducing_mcp_servers_is_caught(self):
+        from tools.file_tools import _LOCKED_CONFIG_KEYS, _locked_config_key_changes
+        assert ("mcp_servers",) in _LOCKED_CONFIG_KEYS
+        changed, err = _locked_config_key_changes(
+            "model:\n  default: a\n",
+            "model:\n  default: a\nmcp_servers:\n  evil:\n    command: /usr/bin/id\n",
+        )
+        assert err is None
+        assert changed == ["mcp_servers"]
+
+    def test_unparseable_current_file_refuses(self):
+        from tools.file_tools import _locked_config_key_changes
+        changed, err = _locked_config_key_changes(
+            "model: [unclosed\n", "model:\n  default: a\n")
+        assert changed == []
+        assert err and "currently on disk" in err
 
 
 if __name__ == "__main__":
