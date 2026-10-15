@@ -83,3 +83,28 @@ def test_large_jobs_keep_upstream_capacity_and_use_supported_fork_runners():
         }
         assert runners["amd64"] == amd64
         assert runners["arm64"] == arm64
+
+
+def test_fork_workspace_checks_keep_internal_parallelism_bounded():
+    steps = _workflow("js-tests.yml")["jobs"]["check"]["steps"]
+    check = next(step for step in steps if step.get("name") == "Run all workspace checks")
+    assert check["env"]["CHECK_CONCURRENCY"] == (
+        "${{ github.repository == 'NousResearch/hermes-agent' && 32 || 1 }}"
+    )
+    assert check["run"].endswith('--concurrency "$CHECK_CONCURRENCY"')
+
+
+def test_vulnerability_scan_uses_the_pinned_local_workflow():
+    jobs = _workflow("osv-scanner.yml")["jobs"]
+    scan = next(job for job in jobs.values() if "uses" in job)
+    assert scan["uses"] == "./.github/workflows/osv-scanner-pinned.yml"
+    pinned = _workflow("osv-scanner-pinned.yml")["jobs"]["osv-scan"]
+    assert pinned["runs-on"] == "ubuntu-24.04"
+    assert any(
+        step.get("uses", "").startswith("google/osv-scanner-action/osv-scanner-action@")
+        for step in pinned["steps"]
+    )
+    assert any(
+        step.get("uses", "").startswith("github/codeql-action/upload-sarif@")
+        for step in pinned["steps"]
+    )
