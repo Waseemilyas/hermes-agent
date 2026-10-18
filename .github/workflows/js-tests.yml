@@ -14,7 +14,7 @@ jobs:
     #
     # One larger runner installs one time. vitest, tsc and eslint each size
     # their own worker pool from the core count.
-    runs-on: ubuntu-latest-32-core
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && 'ubuntu-latest-32-core' || 'ubuntu-24.04' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -62,7 +62,7 @@ jobs:
         with:
           command: npm ci
 
-      # Every check runs at the same time. The step fails only after all of
+      # Checks run within the host budget. The step fails only after all of
       # them finish. There are two reasons this is not ``npm run --ws check``.
       #
       #   * ``--ws`` is serial and stops at the first workspace that fails. A
@@ -80,4 +80,8 @@ jobs:
       # not an empty run, because an empty run reports green after it checks
       # nothing.
       - name: Run all workspace checks
-        run: node .github/scripts/run-workspace-checks.mjs
+        env:
+          # Each suite also parallelizes internally. Avoid oversubscribing the
+          # standard fork runner while retaining upstream large-runner throughput.
+          CHECK_CONCURRENCY: ${{ github.repository == 'NousResearch/hermes-agent' && 32 || 1 }}
+        run: node .github/scripts/run-workspace-checks.mjs --concurrency "$CHECK_CONCURRENCY"

@@ -33,7 +33,7 @@ on:
         description: 'Runner label.'
         required: false
         type: string
-        default: ubuntu-latest
+        default: ubuntu-24.04
       timeout-minutes:
         description: 'Job timeout. A cold run installs real toolchains twice.'
         required: false

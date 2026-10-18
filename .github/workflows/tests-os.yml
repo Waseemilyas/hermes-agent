@@ -3,7 +3,7 @@ name: OS-specific tests
 # Runs the tests that can only be trusted on their own host OS.
 #
 # The main Python suite (.github/workflows/tests.yml) runs on
-# ubuntu-latest and covers everything that is either platform-agnostic or
+# ubuntu-24.04 and covers everything that is either platform-agnostic or
 # genuinely Linux-specific. Tests whose subject is macOS- or
 # Windows-specific behaviour carry a marker (see the ``_OS_MARKS`` block
 # comment in tests/conftest.py) and are SKIPPED on Linux, because faking
@@ -61,7 +61,7 @@ jobs:
             runner: macos-latest
             marker: macos_only
           - name: Windows-only tests
-            runner: windows-latest-32-core
+            runner: ${{ github.repository == 'NousResearch/hermes-agent' && 'windows-latest-32-core' || 'windows-latest' }}
             marker: windows_only
     steps:
       - name: Checkout code
